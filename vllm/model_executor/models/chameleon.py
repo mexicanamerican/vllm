@@ -1,6 +1,6 @@
 from functools import cached_property
-from typing import (Any, Dict, Iterable, List, Literal, Optional, Tuple,
-                    TypedDict)
+from typing import (Any, Dict, Iterable, List, Literal, Mapping, Optional,
+                    Tuple, TypedDict, Union)
 
 import torch
 import torch.nn.functional as F
@@ -10,19 +10,17 @@ from transformers import ChameleonConfig, ChameleonVQVAEConfig
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, MultiModalConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.inputs import INPUT_REGISTRY, InputContext, LLMInputs
-from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler
+from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
@@ -30,14 +28,14 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.image import (cached_get_tokenizer,
-                                   repeat_and_pad_image_tokens)
-from vllm.sequence import IntermediateTensors, SamplerOutput, SequenceData
+from vllm.multimodal.utils import (cached_get_tokenizer,
+                                   repeat_and_pad_placeholder_tokens)
+from vllm.sequence import IntermediateTensors, SequenceData
 from vllm.utils import print_warning_once
 
-from .interfaces import SupportsMultiModal
-
-logger = init_logger(__name__)
+from .interfaces import SupportsMultiModal, SupportsPP
+from .utils import (is_pp_missing_parameter,
+                    make_empty_intermediate_tensors_factory, make_layers)
 
 # These configs are not part of the model config but the preprocessor
 # and processor files, so we hardcode them in the model file for now.
@@ -52,7 +50,7 @@ CHAMELEON_SEP_TOKEN_ID = 8710
 class ChameleonImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
     data: torch.Tensor
-    """Shape: `(batch_size, num_channels, height, width)`"""
+    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
 
 
 def get_max_chameleon_image_tokens(ctx: InputContext):
@@ -61,6 +59,7 @@ def get_max_chameleon_image_tokens(ctx: InputContext):
 
 def dummy_seq_data_for_chameleon(
     seq_len: int,
+    num_images: int,
     *,
     image_token_id: int,
     image_feature_size_override: Optional[int] = None,
@@ -70,12 +69,15 @@ def dummy_seq_data_for_chameleon(
     else:
         image_feature_size = image_feature_size_override
 
-    token_ids = [image_token_id] * image_feature_size
-    token_ids += [0] * (seq_len - image_feature_size)
-    return SequenceData(token_ids)
+    return SequenceData.from_token_counts(
+        (image_token_id, image_feature_size * num_images),
+        (0, seq_len - image_feature_size * num_images),
+    )
 
 
 def dummy_image_for_chameleon(
+    num_images: int,
+    *,
     image_width_override: Optional[int] = None,
     image_height_override: Optional[int] = None,
 ):
@@ -87,17 +89,20 @@ def dummy_image_for_chameleon(
         height = image_height_override
 
     image = Image.new("RGB", (width, height), color=0)
-    return {"image": image}
+    return {"image": image if num_images == 1 else [image] * num_images}
 
 
-def dummy_data_for_chameleon(ctx: InputContext, seq_len: int):
+def dummy_data_for_chameleon(ctx: InputContext, seq_len: int,
+                             mm_counts: Mapping[str, int]):
+    num_images = mm_counts["image"]
 
     seq_data = dummy_seq_data_for_chameleon(
         seq_len,
+        num_images,
         image_token_id=CHAMELEON_IMAGE_TOKEN_ID,
     )
 
-    mm_data = dummy_image_for_chameleon()
+    mm_data = dummy_image_for_chameleon(num_images)
     return seq_data, mm_data
 
 
@@ -115,11 +120,11 @@ def input_processor_for_chameleon(ctx: InputContext, llm_inputs: LLMInputs):
 
     model_config = ctx.model_config
     tokenizer = cached_get_tokenizer(model_config.tokenizer)
-    new_prompt, new_token_ids = repeat_and_pad_image_tokens(
+    new_prompt, new_token_ids = repeat_and_pad_placeholder_tokens(
         tokenizer,
         llm_inputs.get("prompt"),
         llm_inputs["prompt_token_ids"],
-        image_token_id=CHAMELEON_IMAGE_TOKEN_ID,
+        placeholder_token_id=CHAMELEON_IMAGE_TOKEN_ID,
         repeat_count=CHAMELEON_IMAGE_SEQ_LENGTH,
         pad_token_left=CHAMELEON_IMAGE_START_TOKEN_ID,
         pad_token_right=CHAMELEON_IMAGE_END_TOKEN_ID,
@@ -819,6 +824,7 @@ class ChameleonModel(nn.Module):
         config: ChameleonConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -832,14 +838,20 @@ class ChameleonModel(nn.Module):
             config.vocabulary_map)
         decoder_layer = ChameleonDecoderLayer if not self.config.swin_norm \
             else ChameleonSwinDecoderLayer
-        self.layers = nn.ModuleList([
-            decoder_layer(config=config,
-                          cache_config=cache_config,
-                          quant_config=quant_config)
-            for _ in range(config.num_hidden_layers)
-        ])
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: decoder_layer(config=config,
+                                         cache_config=cache_config,
+                                         quant_config=quant_config),
+            prefix=f"{prefix}.layers",
+        )
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.vqmodel = ChameleonVQVAE(config.vq_config)
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size))
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -862,22 +874,33 @@ class ChameleonModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
         else:
-            hidden_states = self.get_input_embeddings(input_ids)
-        residual = None
-        for i in range(len(self.layers)):
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i],
+                kv_caches[i - self.start_layer],
                 attn_metadata,
                 residual,
             )
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -886,7 +909,8 @@ class ChameleonModel(nn.Module):
 @MULTIMODAL_REGISTRY.register_max_image_tokens(get_max_chameleon_image_tokens)
 @INPUT_REGISTRY.register_dummy_data(dummy_data_for_chameleon)
 @INPUT_REGISTRY.register_input_processor(input_processor_for_chameleon)
-class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
+class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal,
+                                        SupportsPP):
 
     def __init__(
         self,
@@ -911,6 +935,8 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size, logit_scale)
         self.sampler = Sampler()
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
 
     def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
 
@@ -937,6 +963,9 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
             raise ValueError("Incorrect type of pixel values. "
                              f"Got type: {type(pixel_values)}")
 
+        # Remove the N dimension until multiple images are supported.
+        pixel_values = pixel_values.squeeze(1)
+
         return ChameleonImagePixelInputs(
             type="pixel_values",
             data=self._validate_pixel_values(pixel_values),
@@ -950,22 +979,26 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, IntermediateTensors]:
 
-        image_input = self._parse_and_validate_image_input(**kwargs)
+        if intermediate_tensors is not None:
+            input_ids = None
+        else:
+            image_input = self._parse_and_validate_image_input(**kwargs)
 
-        if image_input is not None:
-            assert self.model.vqmodel is not None
-            image_tokens = self.model.get_image_tokens(image_input["data"].to(
-                self.config.torch_dtype))
-            image_token_id = self.model.vocabulary_mapping.image_token_id
-            special_image_mask = input_ids == image_token_id
-            image_tokens = image_tokens.to(input_ids.device, input_ids.dtype)
-            input_ids = input_ids.masked_scatter(special_image_mask,
-                                                 image_tokens)
+            if image_input is not None:
+                assert self.model.vqmodel is not None
+                image_tokens = self.model.get_image_tokens(
+                    image_input["data"].to(self.config.torch_dtype))
+                image_token_id = self.model.vocabulary_mapping.image_token_id
+                special_image_mask = input_ids == image_token_id
+                image_tokens = image_tokens.to(input_ids.device,
+                                               input_ids.dtype)
+                input_ids = input_ids.masked_scatter(special_image_mask,
+                                                     image_tokens)
 
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
+                                   attn_metadata, intermediate_tensors)
         return hidden_states
 
     def compute_logits(
@@ -1033,6 +1066,8 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    if is_pp_missing_parameter(name, self):
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
@@ -1054,11 +1089,15 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
                             continue
                         else:
                             name = remapped_kv_scale_name
+                    if is_pp_missing_parameter(name, self):
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
             if use_default_weight_loading and name in params_dict:
+                if is_pp_missing_parameter(name, self):
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

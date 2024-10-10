@@ -7,6 +7,7 @@ from typing import List
 import pytest
 
 from tests.kernels.utils import override_backend_env_variable
+from tests.utils import check_deprecated_block_manager_usage
 from vllm.block import PhysicalTokenBlock
 from vllm.core.block_manager_v1 import CachedBlockAllocator
 from vllm.utils import Device
@@ -16,6 +17,12 @@ from ..models.utils import check_outputs_equal
 MODELS = [
     "facebook/opt-125m",
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def check_deprecated_block_manager():
+    check_deprecated_block_manager_usage(
+        'tests/prefix_caching/test_prefix_caching.py')
 
 
 @pytest.mark.parametrize("block_size", [16])
@@ -34,6 +41,9 @@ def test_block_allocator(
     assert (first_block == second_block)
     assert (second_block.ref_count == 2)
 
+    # Check metric: 1 hit of 2 queries
+    assert block_allocator.get_prefix_cache_hit_rate() == 0.5
+
     # Free the first_block and confirm that the ref_count is correctly
     # decremented on the second block
     block_allocator.free(first_block)
@@ -47,6 +57,10 @@ def test_block_allocator(
     first_block = block_allocator.allocate(block_hash, 0)
     assert (first_block == second_block)
     assert (first_block.block_hash == block_hash)
+
+    # Allocate one more time to get 3/4 hit rate for easy checking
+    block_allocator.allocate(block_hash, 0)
+    assert block_allocator.get_prefix_cache_hit_rate() == 0.75
 
 
 @pytest.mark.parametrize("num_blocks", [16])

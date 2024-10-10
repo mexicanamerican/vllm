@@ -2,13 +2,18 @@ from typing import List, Optional, Tuple
 
 import pytest
 import torch
-from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-NUM_HEADS = [(16, 16), (32, 8), (64, 8)]
+from vllm.utils import seed_everything
+from vllm.vllm_flash_attn import (flash_attn_varlen_func,
+                                  flash_attn_with_kvcache)
+
+NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16, 32]
 DTYPES = [torch.float16, torch.bfloat16]
-NUM_BLOCKS = 32768  # Large enough to test overflow in index calculation.
+# one value large enough to test overflow in index calculation.
+# one value small enough to test the schema op check
+NUM_BLOCKS = [32768, 2048]
 
 
 def ref_paged_attn(
@@ -72,6 +77,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @torch.inference_mode()
 def test_flash_attn_with_paged_kv(
     kv_lens: List[int],
@@ -80,9 +86,10 @@ def test_flash_attn_with_paged_kv(
     dtype: torch.dtype,
     block_size: int,
     soft_cap: Optional[float],
+    num_blocks: int,
 ) -> None:
     torch.set_default_device("cuda")
-    torch.cuda.manual_seed_all(0)
+    seed_everything(0)
     num_seqs = len(kv_lens)
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
@@ -91,7 +98,7 @@ def test_flash_attn_with_paged_kv(
     scale = head_size**-0.5
 
     query = torch.randn(num_seqs, num_query_heads, head_size, dtype=dtype)
-    key_cache = torch.randn(NUM_BLOCKS,
+    key_cache = torch.randn(num_blocks,
                             block_size,
                             num_kv_heads,
                             head_size,
@@ -101,7 +108,7 @@ def test_flash_attn_with_paged_kv(
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(0,
-                                 NUM_BLOCKS,
+                                 num_blocks,
                                  (num_seqs, max_num_blocks_per_seq),
                                  dtype=torch.int32)
 
@@ -126,7 +133,7 @@ def test_flash_attn_with_paged_kv(
         scale=scale,
         soft_cap=soft_cap,
     )
-    assert torch.allclose(output, ref_output, atol=2e-2, rtol=1e-2), \
+    torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(output - ref_output))}"
 
 
@@ -137,6 +144,7 @@ def test_flash_attn_with_paged_kv(
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @torch.inference_mode()
 def test_varlen_with_paged_kv(
     seq_lens: List[Tuple[int, int]],
@@ -146,9 +154,10 @@ def test_varlen_with_paged_kv(
     dtype: torch.dtype,
     block_size: int,
     soft_cap: Optional[float],
+    num_blocks: int,
 ) -> None:
     torch.set_default_device("cuda")
-    torch.cuda.manual_seed_all(0)
+    seed_everything(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
@@ -166,7 +175,7 @@ def test_varlen_with_paged_kv(
                         num_query_heads,
                         head_size,
                         dtype=dtype)
-    key_cache = torch.randn(NUM_BLOCKS,
+    key_cache = torch.randn(num_blocks,
                             block_size,
                             num_kv_heads,
                             head_size,
@@ -181,7 +190,7 @@ def test_varlen_with_paged_kv(
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(0,
-                                 NUM_BLOCKS,
+                                 num_blocks,
                                  (num_seqs, max_num_blocks_per_seq),
                                  dtype=torch.int32)
 
@@ -211,5 +220,5 @@ def test_varlen_with_paged_kv(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
     )
-    assert torch.allclose(output, ref_output, atol=2e-2, rtol=1e-2), \
+    torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(output - ref_output))}"
